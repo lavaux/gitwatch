@@ -10,8 +10,9 @@ GIT_WATCH_DIR=${GIT_WATCH_DIR:-/app/watched-repo}
 GIT_DIR="${GIT_DIR:-}"
 
 # Git options
-GIT_REMOTE=${GIT_REMOTE:-origin}
-GIT_BRANCH=${GIT_BRANCH:-main}
+# Set GIT_REMOTE="" to disable pushing; set GIT_BRANCH="" to push the default branch
+GIT_REMOTE=${GIT_REMOTE-origin}
+GIT_BRANCH=${GIT_BRANCH-main}
 
 # Gitwatch behavior
 SLEEP_TIME=${SLEEP_TIME:-2}
@@ -33,8 +34,12 @@ COMMIT_ON_START=${COMMIT_ON_START:-false}
 cmd=( "/app/gitwatch.sh" )
 
 # Add options with arguments
-cmd+=( -r "${GIT_REMOTE}" )
-cmd+=( -b "${GIT_BRANCH}" )
+if [ -n "${GIT_REMOTE}" ]; then
+  cmd+=( -r "${GIT_REMOTE}" )
+  if [ -n "${GIT_BRANCH}" ]; then
+    cmd+=( -b "${GIT_BRANCH}" )
+  fi
+fi
 cmd+=( -s "${SLEEP_TIME}" )
 cmd+=( -m "${COMMIT_MSG}" )
 cmd+=( -d "${DATE_FMT}" )

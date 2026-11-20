@@ -45,7 +45,7 @@ COMMITMSG="Scripted auto-commit on change (%d) by gitwatch.sh"
 COMMITCMD=""
 PASSDIFFS=0
 LISTCHANGES=-1
-LISTCHANGES_COLOR="--color=always"
+LISTCHANGES_COLOR=(--color=always)
 GIT_DIR=""
 SKIP_IF_MERGING=0
 VERBOSE=0
@@ -136,8 +136,12 @@ verbose_echo() {
 
 # clean up at end of program, killing the remaining sleep process if it still exists
 cleanup() {
+  trap - EXIT
   if [[ -n $SLEEP_PID ]] && kill -0 "$SLEEP_PID" &> /dev/null; then
     kill "$SLEEP_PID" &> /dev/null
+  fi
+  if [[ -n $INW_PID ]] && kill -0 "$INW_PID" &> /dev/null; then
+    kill "$INW_PID" &> /dev/null
   fi
   exit 0
 }
@@ -148,13 +152,16 @@ is_command() {
 }
 
 # Test whether or not current git directory has ongoing merge
+# (also true while a rebase is in progress)
 is_merging () {
-  [ -f "$(git rev-parse --git-dir)"/MERGE_HEAD ]
+  local gitdir
+  gitdir="$("${GIT[@]}" rev-parse --git-dir)" || return 1
+  [[ -f "$gitdir/MERGE_HEAD" || -d "$gitdir/rebase-merge" || -d "$gitdir/rebase-apply" ]]
 }
 
 ###############################################################################
 
-while getopts b:d:h:g:L:l:m:c:C:p:r:s:e:x:MRvf option; do # Process command line options
+while getopts b:d:g:L:l:m:c:p:r:s:e:x:hCMRvf option; do # Process command line options
   case "${option}" in
     b) BRANCH=${OPTARG} ;;
     d) DATE_FMT=${OPTARG} ;;
@@ -166,7 +173,7 @@ while getopts b:d:h:g:L:l:m:c:C:p:r:s:e:x:MRvf option; do # Process command line
     l) LISTCHANGES=${OPTARG} ;;
     L)
       LISTCHANGES=${OPTARG}
-      LISTCHANGES_COLOR=""
+      LISTCHANGES_COLOR=()
       ;;
     m) COMMITMSG=${OPTARG} ;;
     c) COMMITCMD=${OPTARG} ;;
@@ -198,7 +205,7 @@ if [ $# -ne 1 ]; then # If no command line arguments are left (that's bad: no ta
 fi
 
 # if custom bin names are given for git, inotifywait, or readlink, use those; otherwise fall back to "git", "inotifywait", and "readlink"
-if [ -z "$GW_GIT_BIN" ]; then GIT="git"; else GIT="$GW_GIT_BIN"; fi
+if [ -z "$GW_GIT_BIN" ]; then GIT=(git); else GIT=("$GW_GIT_BIN"); fi
 
 if [ -z "$GW_INW_BIN" ]; then
   # if Mac, use fswatch
@@ -220,7 +227,7 @@ fi
 if [ -z "$GW_RL_BIN" ]; then RL="readlink"; else RL="$GW_RL_BIN"; fi
 
 # Check availability of selected binaries and die if not met
-for cmd in "$GIT" "$INW"; do
+for cmd in "${GIT[0]}" "$INW"; do
   is_command "$cmd" || {
     stderr "Error: Required command '$cmd' not found."
     exit 2
@@ -231,8 +238,10 @@ unset cmd
 ###############################################################################
 
 SLEEP_PID="" # pid of timeout subprocess
+INW_PID=""   # pid of the inotifywait/fswatch process
 
 trap "cleanup" EXIT # make sure the timeout is killed when exiting script
+trap "exit 0" INT TERM HUP
 
 # Expand the path to the target to absolute path
 if [ "$(uname)" != "Darwin" ]; then
@@ -254,24 +263,20 @@ if [ -d "$1" ]; then # if the target is a directory
 
   TARGETDIR=$(sed -e "s/\/*$//" <<< "$IN") # dir to CD into before using git commands: trim trailing slash, if any
 
-  # shellcheck disable=SC2086
-  if [ -z $EXCLUDE_PATTERN ]; then
-    EXCLUDE_OPTS="'(\.git/|\.git$)'"
+  if [ -z "$EXCLUDE_PATTERN" ]; then
+    EXCLUDE_OPTS='(\.git/|\.git$)'
   else
-    EXCLUDE_OPTS="'(\.git/|\.git$|$EXCLUDE_PATTERN)'"
+    EXCLUDE_OPTS="(\\.git/|\\.git\$|$EXCLUDE_PATTERN)"
   fi
 
-  # construct inotifywait-commandline
+  # construct inotifywait-commandline (no eval: every argument stays one word)
   if [ "$(uname)" != "Darwin" ]; then
-    # shellcheck disable=SC2206
-    INW_ARGS=("-qmr" "-e" "$EVENTS" "--exclude" $EXCLUDE_OPTS "$(printf "%q" "$TARGETDIR")")
+    INW_ARGS=("-qmr" "-e" "$EVENTS" "--exclude" "$EXCLUDE_OPTS" "$TARGETDIR")
   else
-    # still need to fix EVENTS since it wants them listed one-by-one
-    # shellcheck disable=SC2206
-    INW_ARGS=("--recursive" "$EVENTS" "-E" "--exclude" $EXCLUDE_OPTS "$(printf "%q" "$TARGETDIR")")
+    # fswatch takes the event mask as a single option
+    INW_ARGS=("--recursive" "$EVENTS" "-E" "--exclude" "$EXCLUDE_OPTS" "$TARGETDIR")
   fi
-  GIT_ADD_ARGS="--all ." # add "." (CWD) recursively to index
-  GIT_COMMIT_ARGS=""     # add -a switch to "commit" call just to be sure
+  GIT_ADD_ARGS=(--all .) # add "." (CWD) recursively to index
 
 elif [ -f "$1" ]; then # if the target is a single file
   verbose_echo "Target is a file."
@@ -284,8 +289,7 @@ elif [ -f "$1" ]; then # if the target is a single file
     INW_ARGS=("$EVENTS" "$IN")
   fi
 
-  GIT_ADD_ARGS="$IN" # add only the selected file to index
-  GIT_COMMIT_ARGS="" # no need to add anything more to "commit" call
+  GIT_ADD_ARGS=("$IN") # add only the selected file to index
 else
   stderr "Error: The target is neither a regular file nor a directory."
   exit 3
@@ -300,7 +304,7 @@ if [ -n "$GIT_DIR" ]; then
     exit 4
   fi
 
-  GIT="$GIT --no-pager --work-tree $TARGETDIR --git-dir $GIT_DIR"
+  GIT+=(--no-pager --work-tree "$TARGETDIR" --git-dir "$GIT_DIR")
 fi
 
 # Check if commit message needs any formatting (date splicing)
@@ -315,31 +319,29 @@ cd "$TARGETDIR" || {
   exit 5
 }
 
-if [ -n "$REMOTE" ]; then        # are we pushing to a remote?
+PUSH_CMD=() # empty array means: no push
+PULL_CMD=() # empty array means: no pull
+if [ -n "$REMOTE" ]; then # are we pushing to a remote?
   verbose_echo "Push remote selected: $REMOTE"
-  if [ -z "$BRANCH" ]; then      # Do we have a branch set to push to ?
+  if [ -z "$BRANCH" ]; then # Do we have a branch set to push to ?
     verbose_echo "No push branch selected, using default."
-    PUSH_CMD="$GIT push $REMOTE" # Branch not set, push to remote without a branch
+    PUSH_CMD=("${GIT[@]}" push "$REMOTE") # Branch not set, push to remote without a branch
   else
     # check if we are on a detached HEAD
-    if HEADREF=$($GIT symbolic-ref HEAD 2> /dev/null); then # HEAD is not detached
+    if HEADREF=$("${GIT[@]}" symbolic-ref HEAD 2> /dev/null); then # HEAD is not detached
       verbose_echo "Push branch selected: $BRANCH, current branch: ${HEADREF#refs/heads/}"
-      #PUSH_CMD="$GIT push $REMOTE $(sed "s_^refs/heads/__" <<< "$HEADREF"):$BRANCH"
-      PUSH_CMD="$GIT push $REMOTE ${HEADREF#refs/heads/}:$BRANCH"
+      PUSH_CMD=("${GIT[@]}" push "$REMOTE" "${HEADREF#refs/heads/}:$BRANCH")
     else # HEAD is detached
       verbose_echo "Push branch selected: $BRANCH, HEAD is detached."
-      PUSH_CMD="$GIT push $REMOTE $BRANCH"
+      PUSH_CMD=("${GIT[@]}" push "$REMOTE" "$BRANCH")
     fi
   fi
   if [[ $PULL_BEFORE_PUSH -eq 1 ]]; then
     verbose_echo "Pull before push is enabled."
-    PULL_CMD="$GIT pull --rebase $REMOTE" # Branch not set, pull to remote without a branch
+    PULL_CMD=("${GIT[@]}" pull --rebase "$REMOTE")
   fi
-
 else
   verbose_echo "No push remote selected."
-  PUSH_CMD="" # if not remote is selected, make sure push command is empty
-  PULL_CMD="" # if not remote is selected, make sure pull command is empty
 fi
 
 # A function to reduce git diff output to the actual changed content, and insert file line numbers.
@@ -377,14 +379,14 @@ perform_commit() {
   local LOCAL_FORMATTED_COMMITMSG
 
   if [ -n "$DATE_FMT" ]; then
-    LOCAL_FORMATTED_COMMITMSG="${COMMITMSG/\%d/$(date "$DATE_FMT")}"
+    LOCAL_FORMATTED_COMMITMSG="${COMMITMSG//\%d/$(date "$DATE_FMT")}"
   else
     LOCAL_FORMATTED_COMMITMSG="$FORMATTED_COMMITMSG"
   fi
 
   if [[ $LISTCHANGES -ge 0 ]]; then # allow listing diffs in the commit log message, unless if there are too many lines changed
     local DIFF_COMMITMSG
-    DIFF_COMMITMSG="$($GIT diff -U0 "$LISTCHANGES_COLOR" | diff-lines)"
+    DIFF_COMMITMSG="$("${GIT[@]}" diff -U0 "${LISTCHANGES_COLOR[@]}" | diff-lines)"
     local LENGTH_DIFF_COMMITMSG=0
     if [[ $LISTCHANGES -ge 1 ]]; then
       LENGTH_DIFF_COMMITMSG=$(echo -n "$DIFF_COMMITMSG" | grep -c '^')
@@ -394,10 +396,10 @@ perform_commit() {
       if [ -n "$DIFF_COMMITMSG" ]; then
         LOCAL_FORMATTED_COMMITMSG="$DIFF_COMMITMSG"
       else
-        LOCAL_FORMATTED_COMMITMSG="New files added: $($GIT status -s)"
+        LOCAL_FORMATTED_COMMITMSG="New files added: $("${GIT[@]}" status -s)"
       fi
     else
-      LOCAL_FORMATTED_COMMITMSG=$($GIT diff --stat | grep '|')
+      LOCAL_FORMATTED_COMMITMSG=$("${GIT[@]}" diff --stat | grep '|')
     fi
   fi
 
@@ -405,41 +407,37 @@ perform_commit() {
     if [ "$PASSDIFFS" -eq 1 ]; then
       # If -C is set, pass the list of diffed files to the commit command
       # Unsure whether or not I should check if the command fails
-      LOCAL_FORMATTED_COMMITMSG="$($COMMITCMD < <($GIT diff --name-only))"
+      LOCAL_FORMATTED_COMMITMSG="$($COMMITCMD < <("${GIT[@]}" diff --name-only))"
     else
       LOCAL_FORMATTED_COMMITMSG="$($COMMITCMD)"
     fi
   fi
 
   local STATUS
-  STATUS=$($GIT status -s)
+  STATUS=$("${GIT[@]}" status -s)
   if [ -n "$STATUS" ]; then # only commit if status shows tracked changes.
     verbose_echo "Tracked changes detected."
-    # We want GIT_ADD_ARGS and GIT_COMMIT_ARGS to be word split
-    # shellcheck disable=SC2086
-
     if [ "$SKIP_IF_MERGING" -eq 1 ] && is_merging; then
       verbose_echo "Skipping commit - repo is merging"
       return
     fi
 
-    # shellcheck disable=SC2086
-    $GIT add $GIT_ADD_ARGS # add file(s) to index
-    verbose_echo "Running git add with arguments: $GIT_ADD_ARGS"
-    # shellcheck disable=SC2086
-    $GIT commit $GIT_COMMIT_ARGS -m"$LOCAL_FORMATTED_COMMITMSG" # construct commit message and commit
-    verbose_echo "Running git commit with arguments: $GIT_COMMIT_ARGS -m\"$LOCAL_FORMATTED_COMMITMSG\""
+    verbose_echo "Running git add with arguments: ${GIT_ADD_ARGS[*]}"
+    "${GIT[@]}" add "${GIT_ADD_ARGS[@]}" # add file(s) to index
+    verbose_echo "Running git commit with message: $LOCAL_FORMATTED_COMMITMSG"
+    "${GIT[@]}" commit -m "$LOCAL_FORMATTED_COMMITMSG" || return 1
 
-    if [ -n "$PULL_CMD" ]; then
-      echo "Pull command is $PULL_CMD"
-      verbose_echo "Executing pull command: $PULL_CMD"
-      eval "$PULL_CMD"
+    if [ ${#PULL_CMD[@]} -gt 0 ]; then
+      verbose_echo "Executing pull command: ${PULL_CMD[*]}"
+      if ! "${PULL_CMD[@]}"; then
+        stderr "Error: pull --rebase failed; not pushing. Resolve the repository state manually."
+        return 1
+      fi
     fi
 
-    if [ -n "$PUSH_CMD" ]; then
-      echo "Push command is $PUSH_CMD"
-      verbose_echo "Executing push command: $PUSH_CMD"
-      eval "$PUSH_CMD"
+    if [ ${#PUSH_CMD[@]} -gt 0 ]; then
+      verbose_echo "Executing push command: ${PUSH_CMD[*]}"
+      "${PUSH_CMD[@]}" || stderr "Error: push failed."
     fi
   else
     verbose_echo "No tracked changes detected."
@@ -459,9 +457,11 @@ fi
 #   process some time (in case there are a lot of changes or w/e); if there is already a timer
 #   running when we receive an event, we kill it and start a new one; thus we only commit if there
 #   have been no changes reported during a whole timeout period
-# Would be great to fix the ignored issue below; ignoring it for now.
-# shellcheck disable=SC2294
-eval "$INW" "${INW_ARGS[@]}" | while read -r line; do
+# The loop reads from a process substitution (not a pipe) so it runs in the main shell and
+# SLEEP_PID / INW_PID are visible to the cleanup trap.
+exec 9< <(exec "$INW" "${INW_ARGS[@]}")
+INW_PID=$!
+while read -r line; do
   # In some distributed version of inotifywait, the exclude pattern is not properly enforced. This
   #   leads to multiple commits invoked per change and failing to push to remote. (pull #156)
   if [[ "$line" =~ (^|.*/)\.git(/|$) ]]; then
@@ -471,7 +471,7 @@ eval "$INW" "${INW_ARGS[@]}" | while read -r line; do
   verbose_echo "Change detected: $line"
   # is there already a timeout process running?
   if [[ -n $SLEEP_PID ]] && kill -0 "$SLEEP_PID" &> /dev/null; then
-    # kill it and wait for completion
+    # kill it and wait for completion (a commit already in progress ignores TERM and is waited for)
     kill "$SLEEP_PID" &> /dev/null || true
     wait "$SLEEP_PID" &> /dev/null || true
   fi
@@ -479,8 +479,9 @@ eval "$INW" "${INW_ARGS[@]}" | while read -r line; do
   # start timeout process
   (
     sleep "$SLEEP_TIME" # wait some more seconds to give apps time to write out all changes
+    trap '' TERM        # past this point, don't get killed half-way through a commit/push
     perform_commit
   ) & # and send into background
 
   SLEEP_PID=$! # and remember its PID
-done
+done <&9
